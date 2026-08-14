@@ -43,7 +43,7 @@ class BiguaSimAgent:
         #     max(map(lambda x: reduce(lambda i, j: i * j, x[1].buffer_shape),
         #             self.control_abstractions))
 
-        self._max_control_abstraction_length = 6
+        self._max_control_abstraction_length = 8
         self._action_buffer = \
             self._client.malloc(name, [self._max_control_abstraction_length], np.float32)
         # Teleport flag: 0: do nothing, 1: teleport, 2: rotate, 3: teleport and rotate
