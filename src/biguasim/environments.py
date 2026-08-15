@@ -246,7 +246,17 @@ class BiguaSimEnvironment:
                 return win32event.INFINITE
 
         else:
-            return 60
+            # Was 60 -- too short. Confirmed live (Linux/Vulkan RTX 3050): the
+            # first real env.step() after spawn can block on UE5 compiling
+            # shaders/PSOs for the agent's first render, observed anywhere
+            # from under a second up to 9+ minutes across many runs on this
+            # machine. A tick() timing out here raises posix_ipc.BusyError
+            # with no handler in ArduBiguaSimRunner.run(), crashing the whole
+            # bridge script right as the vehicle finally starts moving.
+            # Bumped with margin over the worst case seen so far; steady-state
+            # ticks (~5ms at 200Hz) will still fail fast on a genuine hang,
+            # just not as fast as before.
+            return 900
 
     @property
     def action_space(self):
