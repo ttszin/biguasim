@@ -34,12 +34,25 @@ class HexaCopterFiveDoF(VehicleModel):
         self.batched_params.height = params['height']
 
         rsphere = ((length + width) / 2)/2
-        self.batched_params.rsphere = rsphere        
-        
-        self.batched_params.I = torch.from_numpy(np.array([params['I'] 
+        self.batched_params.rsphere = rsphere
+
+        self.batched_params.I = torch.from_numpy(np.array([params['I']
                                                            for _ in range(self.batch_size)])).double().to(self.device)
-        
-        self.batched_params.volume = (4/3) * np.pi * rsphere**3
+
+        # Buoyancy/added-mass volume: NOT the same as the rsphere-based sphere
+        # used for drag (Cp/Cr below) -- that sphere massively overestimates
+        # actual hull displacement (a BlueROV2's open frame is mostly not
+        # solid), and using it here made peak buoyancy ~3.1x the vehicle's
+        # own weight (997 * 0.0329 m^3 * g =~ 321.6N vs weight =~ 103.0N for
+        # BlueROV2's 10.5kg) -- an excess force (~218.6N) far beyond the
+        # vehicle's own vertical thrust authority (~59N combined for its 2
+        # vertical rotors), so no PID could ever hold depth against it.
+        # Confirmed live: this produced a violent surface-breach/replunge
+        # limit cycle, not a tunable instability. Sized instead from the
+        # real mass/water-density ratio for a target buoyancy just above
+        # neutral (real ROVs are built slightly positive for safety, same
+        # reasoning the operator gave for this fix).
+        self.batched_params.volume = (params['mass'] / self.batched_params.rho) * 1.02
         self.batched_params.added_mass = self.batched_params.volume * self.batched_params.rho
 
         self.batched_params.buoyancy = np.linalg.norm(self.batched_params.rho * \
@@ -136,12 +149,25 @@ class HexaCopterFiveDoF(VehicleModel):
         z = x[:,2].unsqueeze(-1)
         self.submerged_mask[x[:,2] > -0.1] = 0
 
-        factor = 0.5 * self.batched_params.height * self.batched_params.mass
-        dumping = self.dumping_hack * (torch.clamp(torch.abs(z), min=0, max= factor) / factor) * self.submerged_mask
-        
+        # Buoyancy ramp near the surface. Was: clamp(|z|, 0, 0.5*height*mass)
+        # / (0.5*height*mass) -- a dimensionally meaningless height*mass
+        # denominator (=~1.333 for BlueROV2) meaning buoyancy stayed near
+        # zero until ~1.33m deep, THEN jumped to full strength -- combined
+        # with the volume bug above (peak buoyancy ~3.1x weight), this made
+        # the vehicle sink near the surface (no buoyant support), then rocket
+        # back up once past ~1.33m (excess buoyancy >> thrust authority),
+        # breach the surface where submerged_mask cuts buoyancy to zero
+        # again, and repeat -- confirmed live as the porpoising/surface-
+        # breach cycle. Replaced with a smooth ramp over one hull-height
+        # (half height above/below the surface = 0%/100% submerged), a
+        # physically ordinary partial-submersion model with no hysteresis.
+        half_height = self.batched_params.height / 2.0
+        submersion_fraction = torch.clamp((half_height - z) / self.batched_params.height, min=0.0, max=1.0)
+        dumping = self.dumping_hack * submersion_fraction * self.submerged_mask
+
         #Forces
         W = self.batched_params.weight
-        B = (rho * self.batched_params.volume * self.batched_params.gravity) * dumping 
+        B = (rho * self.batched_params.volume * self.batched_params.gravity) * dumping
         D = -0.5 * rho * torch.einsum('bij,bj->bi', Cp, v *  torch.abs(v))     
         C = torch.cross(w, self.batched_params.mass * v, dim=1) 
         FtotB = (W + B + D + C) 
