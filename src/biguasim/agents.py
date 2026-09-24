@@ -217,6 +217,18 @@ class BiguaSimAgent:
         return self.name
 
 
+class LandingPlatform(BiguaSimAgent):
+    agent_type = "LandingPlatform"
+
+    @property
+    def control_abstractions(self):
+        cmd_vel = "[vx, vy, vz]"
+        return [(cmd_vel, ContinuousActionSpace([3], low=[-10] * 3, high=[10] * 3))]
+
+    def __repr__(self):
+        return "LandingPlatform " + self.name
+
+
 class BlueBoat(BiguaSimAgent):
     agent_type = "BlueBoat"
 
@@ -342,6 +354,7 @@ class AgentDefinition:
     """
 
     _type_keys = {
+        "LandingPlatform": LandingPlatform,
         "BlueBoat": BlueBoat,
         "BlueROV2": BlueROV2,
         "BlueROVHeavy" : BlueROVHeavy,

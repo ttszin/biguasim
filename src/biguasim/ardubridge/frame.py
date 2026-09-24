@@ -40,14 +40,30 @@ def vel_nwu_to_ned(vel) -> list:
     return [vn, -vw, -vu]
 
 
-def imu_glu_to_frd(imu_data) -> tuple:
+def imu_glu_to_frd(imu_data, flip_yaw: bool = False) -> tuple:
     """
     BiguaSim IMUSensor [[ax,ay,az],[p,q,r]] (GLU body) → ([ax,ay,az],[p,q,r]) (FRD body).
     GLU → FRD: negate y and z axes.
+
+    flip_yaw: BlueROV2 / BlueROVHeavy only (VehicleProfile.flip_gyro_yaw). CONFIRMED LIVE
+    (2026-08-30) for ArduSub: only the yaw rate r showed the inverted-response signature
+    (ArduSub's own RATE log: commanded yaw output growing while measured gyro diverged the
+    opposite way -- see uuv.py's mt_z comment); p and q were already correct. So the ROV
+    keeps r un-negated (flip_yaw=True).
+
+    2026-09-24 (T8.2 underwater tests, aerial-autonomy-stack planning/stage_d/NOTES.md): that pair (mt_z negated in uuv.py +
+    r un-negated) makes the gyro yaw rate disagree in sign with the attitude quaternion, and ArduSub's GUIDED position hold spins
+    the ROV within ~60 s. The original mt_z (env BIGUA_MTZ_ORIG=1 in uuv.py) with flip_yaw=False held heading within ~2 deg
+    through a dive and 220 s of navigation. The defaults here are unchanged; the planner tests select the consistent pair.
+
+    2026-09-23: this used to be applied to EVERY vehicle. That broke the DjiMatrice/Hydrone
+    (ArduCopter): its hover, validated with the original -r, became unstable and the vehicle
+    tumbled. The extra flip is now opt-in per profile; every other vehicle gets the original
+    GLU→FRD conversion back.
     """
     ax, ay, az = float(imu_data[0][0]), float(imu_data[0][1]), float(imu_data[0][2])
     p,  q,  r  = float(imu_data[1][0]), float(imu_data[1][1]), float(imu_data[1][2])
-    return [ax, -ay, -az], [p, -q, -r]
+    return [ax, -ay, -az], [p, -q, (r if flip_yaw else -r)]
 
 
 def quat_glu2nwu_to_frd2ned(q_xyzw) -> list:

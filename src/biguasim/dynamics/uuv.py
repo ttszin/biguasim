@@ -1,4 +1,5 @@
 import torch
+import os
 import roma
 
 import numpy as np
@@ -52,7 +53,39 @@ class HexaCopterFiveDoF(VehicleModel):
         # real mass/water-density ratio for a target buoyancy just above
         # neutral (real ROVs are built slightly positive for safety, same
         # reasoning the operator gave for this fix).
-        self.batched_params.volume = (params['mass'] / self.batched_params.rho) * 1.02
+        #
+        # 2026-08-30: multiplier cut further, 1.02 -> 1.002. With
+        # dumping_hack removed (was silently halving this the whole time --
+        # see below), buoyancy B = mass*gravity*k exactly (rho cancels: B =
+        # rho*(mass/rho*k)*g = mass*g*k), so excess = weight*(k-1). At
+        # k=1.02 that's ~2.06N for BlueROV2 (102.97N*0.02) -- correctly
+        # neutralized by PSC_D whenever the control loop is actually
+        # running (confirmed live: TVD/TAD tracked the small error
+        # correctly), but confirmed live this session that the BiguaSim
+        # link can silently freeze mid-flight (matches the already-
+        # documented startup-stall issue, just occurring mid-run instead --
+        # ALL dataflash message types, not just one, stopped simultaneously
+        # while MAVLink heartbeats kept flowing) leaving ArduPilot holding
+        # the last motor command with no fresh feedback to correct it. Any
+        # constant, uncorrected excess is enough to drift to the surface
+        # eventually (at k=1.02's ~0.1 m/s^2 net accel, under 7s over a 2m
+        # gap) and get stuck there (world collision, not our buoyancy/
+        # thrust code -- both zero out once submerged_mask trips). Cutting
+        # the excess ~10x (to ~0.2N, k=1.002) didn't fix the underlying
+        # stall and confirmed live it still drifted (slower, but still
+        # measurably up over the full wait window) -- a deliberately
+        # positive margin means *some* residual climb is mathematically
+        # guaranteed any time the control loop isn't perfectly continuous,
+        # no matter how small. Operator-directed: go to the exact neutral
+        # point instead of chasing smaller and smaller margins. k=1.0 -> B =
+        # mass*gravity*1.0 = weight exactly (see the k derivation above --
+        # rho cancels, B=W*k) -- zero excess, zero deficit, by construction.
+        # Real ROVs run slightly positive on purpose (fail-safe = float to
+        # surface, not sink), so this trades that margin away deliberately
+        # for this sim's own purposes (a persistent drift was worse for
+        # testing than losing the safety-margin philosophy). NOT YET
+        # CONFIRMED LIVE.
+        self.batched_params.volume = (params['mass'] / self.batched_params.rho) * 1.0
         self.batched_params.added_mass = self.batched_params.volume * self.batched_params.rho
 
         self.batched_params.buoyancy = np.linalg.norm(self.batched_params.rho * \
@@ -189,32 +222,141 @@ class HexaCopterFiveDoF(VehicleModel):
         Supports 5DOF (X, Y, Z, roll, yaw).
         """
         
-        self.dumping_hack[(rotor_speeds[:, 0] != 0) & (rotor_speeds[:, 1] != 0)] = 0.5
-        TT = self.batched_params.k_eta[self.idxs] * rotor_speeds[self.idxs]**2 * torch.sign(rotor_speeds[self.idxs])
+        # 2026-08-30: NEUTRALIZED (was: self.dumping_hack[(rotor_speeds[:, 0]
+        # != 0) & (rotor_speeds[:, 1] != 0)] = 0.5). This was a one-way latch
+        # -- self.dumping_hack starts at 1.0 (__init__) and, the FIRST time
+        # both vertical rotors are ever simultaneously nonzero, permanently
+        # drops to 0.5 (halving buoyancy in _compute_external_forces's
+        # `dumping` term for the rest of the run -- never resets). Confirmed
+        # live (2026-08-30) via dataflash RCOU: both vertical motors were
+        # already nonzero (PWM 1300+) from the very first logged sample, so
+        # this had already latched almost immediately after arming in every
+        # real test -- meaning the vehicle has likely been running on HALF
+        # its intended buoyant support for this whole investigation, a
+        # standing reduction in recovery margin, not a per-event effect.
+        # Root-caused as a contributing factor (not the trigger) for a
+        # violent, un-recovered depth excursion: a sudden multi-axis RCOU/ATT
+        # kick (all 6 motors, single 100ms tick -- Unreal/Holodeck physics
+        # glitch signature, not a control-loop divergence) that the vehicle
+        # then couldn't recover from even at full vertical thrust saturation
+        # (278.9), consistent with having half its buoyant margin already
+        # gone. Operator-approved: restore full natural buoyancy, leave
+        # PSC_D gains untouched this pass (don't change plant and controller
+        # together) -- re-tune gains only if this alone leaves it too
+        # sluggish to recover altitude.
+        # 2026-08-30: thrust-curve linearization (operator-directed). Root
+        # cause of the still-unresolved yaw/attitude instability: TT and M
+        # both scale with rotor_speeds^2 (a real, physically-ordinary
+        # thrust-vs-RPM law), but ArduSub's whole mixer/attitude-control
+        # stack is built assuming per-motor OUTPUT is proportional to
+        # per-motor COMMAND (every moment/force decoupling argument in this
+        # file's own comments -- e.g. the ft_x/ft_y/mt_z symmetric-
+        # cancellation proofs -- implicitly relies on this). Confirmed live
+        # with real logged motor values (t=19.02s of a run: m2=-71.8,
+        # m3=-64.8, m4=68.3, m5=66.9) that a nominally pure-forward command
+        # decomposes (solving the mixer's own linear equations) into a real,
+        # nonzero commanded yaw component -- small on its own, but riding on
+        # top of a large forward-thrust common-mode bias, the SQUARING
+        # amplifies that small linear correction into a disproportionately
+        # large torque asymmetry, which demands more correction, which gets
+        # amplified more: a genuine positive-feedback loop. Gain/speed/accel
+        # tuning only ever changed how fast this builds, never removed it
+        # (confirmed across several parameter passes this session).
+        #
+        # Fix: pre-linearize the command before it hits the quadratic law,
+        # so the NET response (ArduSub's command -> actual thrust) is
+        # linear again, matching what the mixer assumes -- v_lin =
+        # sign(v)*sqrt(V_MAX*|v|) makes v_lin^2 = V_MAX*|v|, so
+        # TT ends up proportional to v (not v^2), while full-stick (v =
+        # +-V_MAX) still produces exactly the original max thrust (v_lin =
+        # v at that one point) -- doesn't change vehicle authority/
+        # calibration, only the shape of the response in between.
+        # V_MAX=278.9 matches vehicle.py's `_sub_bipolar = _bipolar_pwm(
+        # -278.9, 278.9)` -- the PWM->command conversion already in use for
+        # this vehicle; rotor_speeds arrives in those same units. NOT YET
+        # CONFIRMED LIVE.
+        V_MAX = 278.9
+        rotor_speeds_lin = torch.sign(rotor_speeds) * torch.sqrt(V_MAX * torch.abs(rotor_speeds))
+
+        TT = self.batched_params.k_eta[self.idxs] * rotor_speeds_lin[self.idxs]**2 * torch.sign(rotor_speeds_lin[self.idxs])
         TT = TT * self.submerged_mask[self.idxs]
 
-        ft_z = TT[:, 0] + TT[:, 1]
+        # Sign flipped here (not via vehicle.py's motor_signs) on purpose:
+        # an isolated (no-SITL) simulation confirmed ArduSub's "ascend"
+        # command produces downward net Z thrust with vertical motors 0-1
+        # at their original per-motor sign -- but flipping via motor_signs
+        # (negating rotor_speeds[0]/[1] before this function even runs)
+        # also flips mt_x below, since both ft_z (a SUM of TT[0],TT[1]) and
+        # mt_x (a DIFFERENCE) are built from the same two signed values --
+        # confirmed live (2026-08-29) that reversing mt_x's direction
+        # doesn't fix, and measurably worsens, a roll-axis instability
+        # that's independent of this Z-direction bug. Flipping the sign
+        # only here, after TT is already computed with the original
+        # per-motor signs, fixes net vertical thrust direction without
+        # touching mt_x's computation below at all -- decouples the two
+        # DOF the way a per-motor sign array structurally can't.
+        ft_z = -(TT[:, 0] + TT[:, 1])
 
         # Rotors 3-6: angled 45° in XY plane
         sqrt = self.batched_params.sqrt
 
          # --- Corrected X/Y force combinations ---
+        # Sign flipped here (same pattern as ft_z above, not via
+        # vehicle.py's motor_signs): an isolated (no-SITL) simulation
+        # confirmed ArduSub's "forward" command produces net *backward*
+        # thrust with sim actuators 2-5 (horizontal) at their original
+        # sign. Flipping via motor_signs would also flip mt_z below (yaw
+        # moment), since mt_z is built from the same M[2..5] values used
+        # here -- exactly the ft_z/mt_x coupling problem already found and
+        # fixed above, now applied to X/Y. Negating the whole ft_x/ft_y
+        # expressions here, after TT is already computed with the original
+        # per-motor signs, fixes surge/sway direction without touching
+        # mt_z's computation below at all. NOT YET CONFIRMED LIVE.
         # Surge (forward) = +x = (front rotors push forward, rear backward)
-        ft_x = ((TT[:, 2] + TT[:, 3]) - (TT[:, 4] + TT[:, 5])) * sqrt
+        ft_x = -(((TT[:, 2] + TT[:, 3]) - (TT[:, 4] + TT[:, 5])) * sqrt)
 
         # Sway (left) = +y = (left rotors push left, right rotors push right)
-        ft_y = ((TT[:, 3] + TT[:, 5]) - (TT[:, 2] + TT[:, 4])) * sqrt
+        ft_y = -(((TT[:, 3] + TT[:, 5]) - (TT[:, 2] + TT[:, 4])) * sqrt)
         FtotB = torch.stack([ft_x, ft_y, ft_z], dim=1)  # (B,3)
 
         # ----- Moments (mt) -----
-        M = self.batched_params.k_m[self.idxs] * rotor_speeds[self.idxs]**2 * torch.sign(rotor_speeds)# (B,6)
+        # Uses rotor_speeds_lin too (same linearization as TT above) -- both
+        # force and moment must come from the same linearized command or
+        # the two would disagree about a motor's effective thrust.
+        M = self.batched_params.k_m[self.idxs] * rotor_speeds_lin[self.idxs]**2 * torch.sign(rotor_speeds_lin[self.idxs])# (B,6)
         # Roll from vertical thrusters
         mt_x = -(M[:, 0] - M[:, 1])
 
         # Pitch negligible for symmetric frame, unless intentionally unbalanced
         mt_y = torch.zeros_like(ft_x)
-        # Yaw from counter-torque of horizontal thrusters
-        mt_z = (M[:, 2] - M[:, 3] - M[:, 4] + M[:, 5]) * sqrt
+
+        # Sign flipped here (same decoupled pattern as ft_z/ft_x/ft_y above --
+        # negate only the final mt_z expression, after M is already computed
+        # with original per-motor signs, so ft_x/ft_y, which reuse the same
+        # TT[2..5] values, are untouched). Root-caused by tracing
+        # motor_mapping=[5,4,1,0,3,2] through ArduSub's own SUB_FRAME_VECTORED
+        # factor table (AP_Motors6DOF.cpp): sim actuators 2,3,4,5 map to
+        # MOT2,MOT1,MOT4,MOT3, whose yaw_fac are -1,+1,+1,-1 respectively.
+        # Substituting into the original (M[2]-M[3]-M[4]+M[5]) formula and
+        # simulating a positive ArduSub yaw command (MOT1/MOT4 up,
+        # MOT2/MOT3 down) produces a NEGATIVE mt_z -- confirmed both
+        # algebraically and numerically (isolated, no-SITL test) -- i.e. the
+        # yaw moment was applied opposite to ArduSub's own commanded
+        # direction. This is a plausible root cause for a sustained,
+        # non-decaying heading oscillation observed live (2026-08-29):
+        # inverted-sign feedback, not underdamped-but-correct gains, matches
+        # the observed signature (angular_vel.z swinging -70..+30 deg/s,
+        # heading never converging) far better than a gain-tuning problem.
+        # Cross-checked the same derivation method against mt_x (roll) below,
+        # which is NOT flipped: it comes out correctly signed for the same
+        # substitution, consistent with the already-confirmed-live result
+        # that reversing mt_x's sign made roll worse, not better -- giving
+        # confidence in this method before applying it here. NOT YET
+        # CONFIRMED LIVE for mt_z specifically -- needs a fresh SITL test.
+        # BIGUA_MTZ_ORIG=1 restores the ORIGINAL sign (measured 2026-09-24 in the T8.2 underwater SITL tests: with the negated mt_z
+        # above, the gyro yaw rate (flip_gyro_yaw=True) has the opposite sign to the attitude quaternion's and GUIDED spins the ROV;
+        # the original mt_z with flip_gyro_yaw=False is consistent). Default stays as before so nothing else changes.
+        mt_z = (1.0 if os.environ.get("BIGUA_MTZ_ORIG") == "1" else -1.0) * ((M[:, 2] - M[:, 3] - M[:, 4] + M[:, 5]) * sqrt)
 
         MtotB = torch.stack([mt_x, mt_y, mt_z], dim=1)  # (B,3)
 

@@ -85,6 +85,9 @@ class VehicleProfile:
     warmup_frames: int = 1700
     """Number of frames to hold motors at zero on startup."""
 
+    flip_gyro_yaw: bool = False
+    """Do not negate the yaw rate in the GLU→FRD gyro conversion (BlueROV2/Heavy, see frame.imu_glu_to_frd)."""
+
 
 # ---------------------------------------------------------------------------
 # VEHICLE_REGISTRY
@@ -100,28 +103,23 @@ VEHICLE_REGISTRY: dict[str, VehicleProfile] = {
         num_motors=6,
         # sim actuators r1..r6 ← AP PWM channels MOT6,5,2,1,4,3
         motor_mapping=[5, 4, 1, 0, 3, 2],
-        # All six flipped from [1]*6, via an isolated dynamics-only
-        # simulation (no SITL) reproducing ArduSub's own SUB_FRAME_VECTORED
-        # per-motor factor table (AP_Motors6DOF.cpp), mapped through
-        # motor_mapping above and fed into
-        # HexaCopterFiveDoF._compute_body_wrench(): with the original
-        # [1]*6, ArduSub's "forward" command produced *backward* thrust and
-        # its "ascend" command produced *downward* thrust -- a full sign
-        # inversion on the tested axes. This would explain a full day of
-        # position/depth-hold overshoot that no PSC gain change (P halved,
-        # I cut, twice, plus WP_SPD) could fix: a sign-inverted closed loop
-        # can't be tuned into stability by adjusting gain magnitude alone.
-        # Flipping all six made the isolated simulation self-consistent
-        # (forward -> forward force, ascend -> upward force, lateral/yaw
-        # inverted together). NOT CONFIRMED LIVE: the one live end-to-end
-        # test after this change showed the vehicle tumbling (roll/yaw
-        # 40-65 deg/s, quaternion near 180 deg) and drifting away from the
-        # target rather than holding -- unclear yet whether that means this
-        # fix is wrong/incomplete, or a separate pre-existing rotation
-        # instability (see aerial-autonomy-stack's biguasim_bridge/
-        # README.md, "bug #9") is confounding the result. Needs a test that
-        # isolates translation from rotation before trusting this value.
-        motor_signs=[-1, -1, -1, -1, -1, -1],
+        # Back to the fully-original [1]*6 (2026-08-29), after four
+        # motor_signs combinations were tried and only this one is
+        # rotationally stable in isolated velocity-only tests (see
+        # aerial-autonomy-stack's biguasim_bridge/README.md, "2026-08-16
+        # evening" and "2026-08-29" sections, for the full trail: all-six-
+        # flipped, vertical-only-flipped, and horizontal-only-flipped each
+        # produced a growing roll- or yaw-axis instability; only the
+        # original didn't). The real, separate vertical-axis translation
+        # bug this was chasing (ArduSub's "ascend" producing net *downward*
+        # thrust) is fixed instead directly in uuv.py's
+        # HexaCopterFiveDoF._compute_body_wrench() (the `ft_z` sign, right
+        # after TT is computed) -- that decouples the Z-direction fix from
+        # the roll-moment computation (`mt_x`) in a way no motor_signs
+        # combination can, since ft_z (a sum of the same two per-motor
+        # values) and mt_x (their difference) can't be flipped
+        # independently by negating shared inputs upstream.
+        motor_signs=[1, 1, 1, 1, 1, 1],
         pwm_converters=[_sub_bipolar] * 6,
         control_abstraction="cmd_motor_speeds",
         ardupilot_vehicle="ArduSub",
@@ -130,6 +128,7 @@ VEHICLE_REGISTRY: dict[str, VehicleProfile] = {
             "-f JSON:127.0.0.1 --add-param-file=bluerov2.parm"
         ),
         include_depth_sensor=True,
+        flip_gyro_yaw=True,
     ),
 
     "BlueROVHeavy": VehicleProfile(
@@ -146,6 +145,7 @@ VEHICLE_REGISTRY: dict[str, VehicleProfile] = {
             "-f JSON:127.0.0.1 --add-param-file=bluerovheavy.parm"
         ),
         include_depth_sensor=True,
+        flip_gyro_yaw=True,
     ),
 
     "BlueBoat": VehicleProfile(

@@ -164,7 +164,7 @@ class ArduPilotBridge:
         def _all_finite(*lists):
             return all(math.isfinite(v) for lst in lists for v in lst)
 
-        accel, gyro = imu_glu_to_frd(agent_state["IMUSensor"])
+        accel, gyro = imu_glu_to_frd(agent_state["IMUSensor"], flip_yaw=getattr(self._profile, "flip_gyro_yaw", False))
         pos  = pos_nwu_to_ap(agent_state["LocationSensor"].tolist(), self._gps_origin)
         vel  = vel_nwu_to_ned(agent_state["VelocitySensor"].tolist())
         quat = quat_glu2nwu_to_frd2ned(agent_state["DynamicsSensor"][-4:].tolist())

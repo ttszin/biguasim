@@ -3,6 +3,50 @@ import numpy as np
 from biguasim.dynamics import uav, uuv, usv
 
     
+class LandingPlatform(usv.Catamaran):
+    """Static landing platform. Moved exclusively via agent.teleport()."""
+    _params = {
+        'rho': 1026,
+        'mass': 100.0,
+        'length': 5.0,
+        'width': 5.0,
+        'height': 0.3,
+        'I': np.diag([100.0, 100.0, 100.0]),
+        'rotor_pos': {
+            'r1': np.array([-2.0, 0.0, 0.0]),
+            'r2': np.array([ 2.0, 0.0, 0.0]),
+        },
+        'rotor_directions': np.array([[1, 0, 0], [1, 0, 0]]),
+        'k_eta': 3.55e-4,
+        'k_m': 1.12e-5,
+        'rotor_speed_min': -1.0,
+        'rotor_speed_max':  1.0,
+        'k_vx': 0.0,
+        'kp_yaw': 0.0,
+        'kd_yaw': 0.0,
+        'kp_pos': 0.0,
+        'kd_pos': 0.0,
+    }
+
+    _scheme = 2
+
+    def __init__(self, batch_size=1, device='cpu', control_abstraction='cmd_vel', params=None):
+        super().__init__(
+            batch_size,
+            params=params or LandingPlatform._params,
+            device=device,
+            control_abstraction=control_abstraction,
+        )
+
+    @property
+    def params(self) -> dict:
+        return self._params
+
+    def step(self, state, control, dt):
+        # Platform is fully controlled via teleport(); dynamics are intentionally zeroed.
+        return [[0.0] * 6 for _ in range(self.batch_size)]
+
+
 class BlueBoat(usv.Catamaran):                                                                   
     _params = {
         # 'rho' : 1026,      # Water density
@@ -25,7 +69,7 @@ class BlueBoat(usv.Catamaran):
                                       [1, 0, 0]]),
 
 
-        'k_eta' : 3.55e-4,  # Rotor torque constant
+        'k_eta' : 3.55e-3,  # Rotor torque constant -- PATCH LOCAL 10x (2026-08-24): valor original (3.55e-4) era pequeno demais pra produzir movimento real (confirmado empiricamente, ver agent.py PLATFORM_K_ETA). Validado: da' hold parado perfeito e movimento em curva controlavel com o controlador proprio em agent.py._advance_platform.
         'k_m' : 1.12e-5,    # Rotor momentum constant
 
         'rotor_speed_min': -295.75,   # minimum rotor speed, rad/s
@@ -231,14 +275,28 @@ class DjiMatrice(uav.QuadCopterX):
         'rotor_speed_max': 592.4, # maximum rotor speed, rad/s
 
         # Frame aerodynamic properties
+        # TESTADO c_Dx=c_Dy=0 (2026-08-25): NAO explica o teto de vel_xy
+        # real (~1.47 m/s pra comando de 3.0 m/s) -- so mudou pra ~1.50,
+        # praticamente igual. O arrasto nao e' a causa (calculo a mao ja'
+        # sugeria isso: D~0.22N e' pequeno demais perto dos ~5.6N de
+        # tracao horizontal disponivel). Revertido pro valor original.
         'c_Dx': 0.1,            # parasitic drag coefficient in body x-axis, N/(m/s)^2
         'c_Dy': 0.1,            # parasitic drag coefficient in body y-axis, N/(m/s)^2
         'c_Dz': 0.15,           # parasitic drag coefficient in body z-axis, N/(m/s)^2
 
         # Lower level controller properties (for higher level control abstractions)
-        'k_v': 1,              # The *world* velocity P gain (for cmd_vel)
-        'kp_att': 0.1,            # The attitude P gain (for cmd_vel, cmd_vel_yaw and cmd_pos_yaw)
-        'kd_att': 0.01,          # The attitude D gain (for cmd_vel, cmd_vel_yaw and cmd_pos_yaw)
+        'k_v': 1,              # The *world* velocity P gain (for cmd_vel) -- TESTADO k_v=4 (2026-08-25): NAO ajudou (vel_xy real ficou levemente PIOR, 1.433 vs 1.469), revertido. O teto de ~1.47 m/s nao e' causado pelo ganho do loop de velocidade.
+        # kp_att/kd_att originais (0.1 / 0.01) eram baixos demais pra inércia
+        # deste veiculo (I_xx=I_yy=0.07): cmd_moment = I @ (-kp*att_err - kd*w)
+        # resultava em torque de pitch/roll ~0.002 N.m mesmo com erro de
+        # atitude de ~17 graus -- o dronedar tenta inclinar mas na pratica
+        # nao ha deslocamento horizontal perceptivel em varios segundos.
+        # Reajustado pra kp_att~=wn^2, kd_att~=2*zeta*wn com wn~=12rad/s,
+        # zeta~=0.8 (resposta rapida mas amortecida). TODO_CALIBRAR: validar
+        # empiricamente se converge sem oscilar/"shaking" (ver comentario
+        # sobre k_eta acima, que já foi reduzido por causa desse sintoma).
+        'kp_att': 150.0,          # The attitude P gain (for cmd_vel, cmd_vel_yaw and cmd_pos_yaw)
+        'kd_att': 20.0,           # The attitude D gain (for cmd_vel, cmd_vel_yaw and cmd_pos_yaw)
 
         'kp_yaw': 1,            # The attitude P gain (for cmd_vel_yaw)
         'kd_yaw': 0.1,          # The attitude D gain (for cmd_vel_yaw)
@@ -387,6 +445,7 @@ class TorpedoAUV(uuv.TorpedoAUV):
 
 class ModelsFactory:
     _types = {
+        'LandingPlatform': LandingPlatform,
         'BlueBoat' : BlueBoat,
         'BlueROV2' : BlueROV2,
         'BlueROVHeavy' : BlueROVHeavy,

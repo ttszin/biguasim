@@ -23,11 +23,22 @@ class Catamaran(VehicleModel):
         self._build_params(params)
 
         self.submerged_mask = torch.zeros(self.batch_size, 1, device=self.device).double()
-        
+        self.thrust_submerged_mask = torch.zeros(self.batch_size, 1, device=self.device).double()
+
         # a hack to generate a nice buoyancy behavior :)
         self.dumping_hack = torch.ones(self.batch_size, 1).to(device=self.device)
 
         self.gen_moments = torch.ones(self.batch_size, 3).to(device=self.device)
+
+        # PATCH LOCAL (nao upstream) -- 2026-08-24: forca extra opcional
+        # (3-vetor, N), somada direto no balanco de forcas em
+        # _compute_external_forces. Zero por padrao (sem efeito). Usado
+        # pelo agent.py pra simular o peso de algo pousado no convés
+        # (ex: o drone) -- sem isso, o calculo de empuxo do Catamaran nao
+        # tem como saber que ha peso extra em cima dele (confirmado
+        # empiricamente: o barco assenta na MESMA altura com ou sem o
+        # drone pousado).
+        self.extra_weight_force = torch.zeros(self.batch_size, 3, device=self.device).double()
         
 
     def _build_params(self, params : dict):
@@ -42,6 +53,44 @@ class Catamaran(VehicleModel):
         
         #ellipsoid
         self.batched_params.volume = (4/3) * np.pi * (2*width) * length * (height/2)
+        # PATCH LOCAL (nao upstream) -- 2026-08-24: a formula de volume
+        # acima faz o barco flutuar com so' ~10% do casco submerso (quase
+        # todo fora d'agua), pra mass=14.5kg -- observado visualmente
+        # (usuario). Reduzido pra mirar ~35% submerso no equilibrio
+        # (peso=empuxo): fator calculado a partir de
+        # mass/(0.7*rho*volume*fracao_alvo), validar empiricamente com o
+        # teste de hold parado (mesmo script usado nesta sessao) e ajustar
+        # BUOYANCY_VOLUME_SCALE se nao bater com o visual esperado.
+        # 2026-08-24: reduzido ainda mais (0.18 -> 0.066) -- comparação
+        # visual (screenshots em várias alturas teleportadas) mostrou que
+        # o casco só fica visivelmente "na água" (não boiando por cima)
+        # em z<=-0.30, mas a fórmula de submersão só alcança equilíbrio
+        # estável até z=-height/2=-0.188 (100% submerso, o chão da
+        # fórmula) -- mirando bem perto desse limite (~95% submerso) como
+        # o mais fundo fisicamente possível sem mudar o parâmetro height.
+        # 2026-08-24: aumentado de novo (0.066 -> 0.09) -- 0.066 deixava o
+        # empuxo maximo quase igual ao peso do barco vazio (sem quase
+        # nenhuma margem), entao o peso extra do drone pousado (patch
+        # extra_weight_force) fazia o conjunto afundar SEM PARAR (sem
+        # equilibrio possivel). 0.09 dava margem suficiente (equilibrio
+        # com drone convergiu em z=-0.16, 0.07m mais fundo que vazio --
+        # mecanismo de peso confirmado funcionando), mas deixou o barco
+        # vazio raso demais visualmente (z=-0.09, regressao do -0.42
+        # anterior). 2026-08-25: tentei 0.075 (meio-termo) -- resultado
+        # PIOR, nao melhor: nao e' uma transicao suave entre "raso" e
+        # "afunda sem parar", e' um penhasco de instabilidade bem perto
+        # de 0.09 (a 0.075 o conjunto barco+drone afundou sem limite,
+        # pior que a 0.066 original). Voltado pra 0.09 (unico valor
+        # testado que converge com o drone pousado, com folga --
+        # ver teste_peso_drone_no_barco.py no scratchpad da sessao).
+        # Descartada a ideia de achar um scale que sirva pros dois
+        # objetivos (vazio fundo + margem de peso) -- sao objetivos
+        # conflitantes nesse modelo de empuxo linear. Ajuste fino do
+        # visual do casco vazio deve vir de outro lugar (calibrar
+        # contra screenshot real, nao contra o Z do sensor -- ja
+        # documentado que os dois nao batem 1:1).
+        BUOYANCY_VOLUME_SCALE = 0.09
+        self.batched_params.volume = self.batched_params.volume * BUOYANCY_VOLUME_SCALE
         self.batched_params.added_mass = self.batched_params.volume * self.batched_params.rho
 
         self.batched_params.buoyancy = np.linalg.norm(self.batched_params.rho * \
@@ -74,6 +123,12 @@ class Catamaran(VehicleModel):
 
         x,y,z = params["rotor_pos"]['r1']
         self.batched_params.rotor_distance = np.sqrt(x**2 + y**2 + z**2) *.1
+        # PATCH LOCAL (nao upstream) -- offset em z dos rotores relativo a
+        # origem do corpo, usado em _compute_body_wrench pra mascarar o
+        # empuxo pela profundidade real do rotor (nao da origem do corpo,
+        # que fica bem acima na altura de repouso normal do barco -- ver
+        # investigacao 2026-08-24).
+        self.batched_params.rotor_z_offset = float(z)
 
         alloc_mats = []
         for i in range(self.batch_size):
@@ -132,19 +187,48 @@ class Catamaran(VehicleModel):
         Cp = self.batched_params.Cp 
         Cr = self.batched_params.Cr
 
-        self.submerged_mask = torch.ones(self.batch_size, 1, device=self.device).double()
+        # PATCH LOCAL (nao upstream, so nesta instalacao editavel) --
+        # 2026-08-24: o submerged_mask original era um liga/desliga BINARIO
+        # (1 se z <= -height/2, senao 0 -- sem gradacao por profundidade
+        # real), o que fazia o empuxo ligar/desligar bruscamente em vez de
+        # crescer suavemente com a submersao -- na pratica um oscilador
+        # tipo rele (queda livre acima do limiar, empuxo forte abaixo dele,
+        # repete), nao um sistema massa-mola-amortecedor normal. Medido
+        # empiricamente: BlueBoat parado (cmd_pos_yaw segurando x/y) nunca
+        # convergia em z, oscilando +-0.3m ainda depois de 1500 ticks (50s).
+        # Troca pra fracao continua de submersao (tipo Arquimedes real) --
+        # deve dar uma forca restauradora suave em torno do equilibrio
+        # (empuxo=peso), assentando com o arrasto ja existente em vez de
+        # ficar bicando indefinidamente.
         z = x[:,2].unsqueeze(-1)
-        self.submerged_mask[(x[:,2] > -(self.batched_params.height/2))] = 0
+        depth_submerged = torch.clamp(-z + self.batched_params.height/2, min=0, max=self.batched_params.height)
+        self.submerged_mask = depth_submerged / self.batched_params.height
 
-        factor = .5 * self.batched_params.height * self.batched_params.mass
-        dumping = .7 * self.dumping_hack * (torch.clamp(torch.abs(z), min=0, max= factor) / factor) * self.submerged_mask
+        dumping = .7 * self.dumping_hack * self.submerged_mask
+
+        # PATCH LOCAL (nao upstream) -- 2026-08-24: mascara SEPARADA pro
+        # empuxo dos rotores, baseada na profundidade real do ROTOR (nao
+        # da origem do corpo, que fica bem acima na altura de repouso
+        # normal do barco). Medido empiricamente: cmd_motor_speeds em
+        # rotor_speed=150 nao produzia NENHUM movimento (v=0 exato) na
+        # altura de repouso normal (PLATFORM_HEIGHT=0.15), mas produzia
+        # movimento real com o barco bem submerso (z=-1.0) -- confirma que
+        # a fisica de propulsao funciona, só a mascara pela origem do
+        # corpo zerava o empuxo indevidamente com o rotor (0.276m abaixo
+        # da origem) ainda bem submerso. Rotor e' pequeno (ponto, nao tem
+        # "altura" própria pra normalizar como o casco) -- usa uma faixa
+        # de transição fixa e estreita em torno da linha d'água só pra
+        # manter continuidade/diferenciabilidade, não a altura do casco.
+        ROTOR_SUBMERGE_BAND = 0.05  # m
+        rotor_z = z + self.batched_params.rotor_z_offset  # aproximação: ignora roll/pitch (~0 p/ barco em água calma)
+        self.thrust_submerged_mask = torch.clamp(-rotor_z / ROTOR_SUBMERGE_BAND, min=0.0, max=1.0)
         
         #Forces
         W = self.batched_params.weight
         B = (rho * self.batched_params.volume * self.batched_params.gravity) * dumping
         D = -0.5 * rho * torch.einsum('bij,bj->bi', Cp, v *  torch.abs(v))     
         C = torch.cross(w, self.batched_params.mass * v, dim=1) 
-        FtotB = (W + B + D + C) 
+        FtotB = (W + B + D + C + self.extra_weight_force[self.idxs]) 
         
         #Moments
         M1 = -torch.cross(w, torch.einsum('bij,bj->bi', self.batched_params.I, w), dim=1)
@@ -163,9 +247,22 @@ class Catamaran(VehicleModel):
         Supports 5DOF (X, Y, Z, roll, yaw).
         """
         
-        self.dumping_hack[(rotor_speeds[:, 0] != 0) & (rotor_speeds[:, 1] != 0)] = 0.5
+        # PATCH LOCAL (nao upstream) -- 2026-08-24: DESLIGADO. Essa linha
+        # reduzia a forca de empuxo (buoyancy) pela metade sempre que os
+        # DOIS rotores estavam ativos (ou seja, toda vez que o barco anda
+        # pra frente) -- acoplamento entre propulsao e flutuacao que nao
+        # faz sentido fisico e causava afundamento CONTINUO (sem
+        # equilibrio) do barco enquanto em movimento, depois do ajuste de
+        # BUOYANCY_VOLUME_SCALE (empuxo maximo com o rotor ligado ficava
+        # menor que o peso do barco). Confirmado empiricamente: z caindo
+        # sem parar (-0.42 -> -3.6 em 140 ticks) assim que v_des>0.
+        # self.dumping_hack[(rotor_speeds[:, 0] != 0) & (rotor_speeds[:, 1] != 0)] = 0.5
         TT = self.batched_params.k_eta[self.idxs] * rotor_speeds[self.idxs]**2 * torch.sign(rotor_speeds[self.idxs])
-        TT = TT * self.submerged_mask[self.idxs]
+        # PATCH LOCAL (nao upstream) -- usa thrust_submerged_mask (baseado
+        # na profundidade do rotor), nao submerged_mask (baseado na
+        # origem do corpo, usado só pra flutuação) -- ver investigação
+        # 2026-08-24 em _compute_external_forces.
+        TT = TT * self.thrust_submerged_mask[self.idxs]
 
                 # Surge (forward) = +x = (front rotors push forward, rear backward)
         ft_x = TT[:, 0] + TT[:, 1]

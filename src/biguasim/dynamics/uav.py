@@ -218,12 +218,20 @@ class QuadCopterX(VehicleModel):
             tmp = -self.batched_params.kp_att[self.idxs] * att_err - self.batched_params.kd_att[self.idxs] * state['w'][self.idxs]
             cmd_moment = (self.batched_params.I[self.idxs] @ tmp.unsqueeze(-1)).squeeze(-1) \
                         + torch.cross(state['w'][self.idxs], Iw.squeeze(-1), dim=-1)
-            
+
             # --- Map thrust & moments to rotor speeds ---
             TM = torch.cat([cmd_thrust, cmd_moment.squeeze(-1)], dim=-1)
             cmd_rotor_thrusts = (self.batched_params.TM_to_f[self.idxs] @ TM.unsqueeze(1).transpose(-1, -2)).squeeze(-1)
             cmd_motor_speeds = cmd_rotor_thrusts / self.batched_params.k_eta[self.idxs]
             cmd_motor_speeds = torch.sign(cmd_motor_speeds) * torch.sqrt(torch.abs(cmd_motor_speeds))
+
+            import os
+            if os.environ.get("BIGUASIM_DEBUG_CMDVEL"):
+                print(f"[DBG] v={state['v'][0].tolist()} cmd={control['cmd_ctrl'][0].tolist()} "
+                      f"v_err={v_err[0].tolist()} a_cmd={a_cmd[0].tolist()} F_des={F_des[0].tolist()} "
+                      f"cmd_thrust={cmd_thrust[0].tolist()} b3_des={b3_des[0].tolist()} "
+                      f"att_err={att_err[0].tolist()} cmd_moment={cmd_moment[0].tolist()} "
+                      f"motor_speeds={cmd_motor_speeds[0].tolist()}", flush=True)
 
             return cmd_motor_speeds
         

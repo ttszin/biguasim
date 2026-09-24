@@ -16,10 +16,36 @@ Usage:
 
 from __future__ import annotations
 
+import time
+
 import biguasim
 
 from .bridge import ArduPilotBridge
 from .vehicle import VehicleProfile
+
+# 2026-08-30: watchdog threshold for env.step() -- this is the one blocking
+# call in the whole loop that can hang waiting on Holodeck/Unreal (the
+# already-documented startup stall, "GPU pinned at 0%... under a second to
+# 9+ minutes", now suspected of also happening mid-flight and possibly
+# explaining an observed uncommanded rise: with the lock-step architecture
+# below (physics only advances inside this call, gated on a fresh PWM
+# packet), a stall here freezes physics entirely -- what an operator sees
+# during one may be the render thread interpolating the last real tick, not
+# genuine motion. No action taken here beyond logging (deliberately -- this
+# is a diagnostic instrument, not a fix for the stall itself).
+# (FS_EKF_ACTION was tried as active protection on the ArduPilot side --
+# t2_biguasim_bluerov2.parm -- but any nonzero value reproducibly crashes
+# SITL boot in this ArduSub build, 3/3, unrelated to arming.disarm() itself;
+# abandoned, reverted to 0. This watchdog is the only instrumentation left.)
+#
+# Cut 0.5 -> 0.05s (2026-08-30): confirmed 0.5s never fired at all across a
+# ~64s run that still climbed ~8cm in small, discrete steps (PSCD: long
+# flat plateaus at the mm level, then a jump -- not a smooth monotonic
+# drift). If that's coming from short Holodeck hiccups too brief to cross
+# 0.5s, they'd still show up here -- 0.05s is 10x the nominal per-tick dt
+# at 200 ticks/sec (5ms), loose enough not to fire on ordinary scheduling
+# jitter, tight enough to catch anything meaningfully longer than one tick.
+_STEP_STALL_WARN_S = 0.05
 
 _DEFAULT_GPS_ORIGIN = (33.810313, -118.393867)
 
@@ -72,7 +98,21 @@ class ArduBiguaSimRunner:
                     continue
                 motor_cmds = bridge.pwm_to_motor_cmds(pwm, frame)
 
+                # Watchdog: env.step() is the one call that can block on
+                # Holodeck (see _STEP_STALL_WARN_S above) -- timed
+                # unconditionally (perf_counter is cheap) so a stall gets
+                # caught the first time it happens, not only after someone
+                # remembers to go add logging for it.
+                step_start = time.perf_counter()
                 raw = env.step(motor_cmds)
+                step_elapsed = time.perf_counter() - step_start
+                if step_elapsed > _STEP_STALL_WARN_S:
+                    print(
+                        f"  [WATCHDOG] env.step() took {step_elapsed:.2f}s "
+                        f"(frame={frame}, sim_time={sim_time:.2f}s) -- "
+                        f"Holodeck/BiguaSim stall suspected, physics was "
+                        f"frozen for this whole duration."
+                    )
                 agent_state = raw[agent][0]
                 sim_time += dt
 
