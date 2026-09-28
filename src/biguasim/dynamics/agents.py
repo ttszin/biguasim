@@ -85,6 +85,11 @@ class BlueBoat(usv.Catamaran):
         'kp_pos': .1,            # The attitude P gain (for cmd_pos_yaw)
         'kd_pos': .1,            # The attitude D gain (for cmd_pos_yaw)
 
+        # PATCH testes-biguagym (P2): amortecimento de guinada. Calibrado para ~30°/s em regime
+        # na curva (60, 120) rad/s (Mz = 10.8 N.m) e parada em ~1 s com motores desligados.
+        # Sem referência do barco real -- revisar.
+        'yaw_damp_lin': 10.0,     # N.m.s/rad
+        'yaw_damp_quad': 17.0,    # N.m.s^2/rad^2
     }            
 
     _scheme = 2

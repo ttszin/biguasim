@@ -30,6 +30,12 @@ class Catamaran(VehicleModel):
 
         self.gen_moments = torch.ones(self.batch_size, 3).to(device=self.device)
 
+        # PATCH testes-biguagym (P2): amortecimento hidrodinâmico de guinada
+        # N = -(yaw_damp_lin*r + yaw_damp_quad*r|r|), só com o casco na água.
+        # Padrão 0 (sem efeito) para quem não define os parâmetros.
+        self._yaw_damp_lin = float(params.get('yaw_damp_lin', 0.0))
+        self._yaw_damp_quad = float(params.get('yaw_damp_quad', 0.0))
+
         # PATCH LOCAL (nao upstream) -- 2026-08-24: forca extra opcional
         # (3-vetor, N), somada direto no balanco de forcas em
         # _compute_external_forces. Zero por padrao (sem efeito). Usado
@@ -241,6 +247,11 @@ class Catamaran(VehicleModel):
                                                   w *  torch.abs(w) * self.batched_params.rotor_distance)
         MtotB = (M1 + M2)  * self.gen_moments
 
+        # PATCH testes-biguagym (P2)
+        r = w[:, 2]
+        M_yaw_damp = -(self._yaw_damp_lin * r + self._yaw_damp_quad * r * torch.abs(r)) * self.submerged_mask[:, 0]
+        MtotB = MtotB + torch.stack([torch.zeros_like(r), torch.zeros_like(r), M_yaw_damp], dim=1)
+
         return (FtotB, MtotB) 
     
 
@@ -353,7 +364,9 @@ class Catamaran(VehicleModel):
             yaw_rate = w[:, 2]
             yaw_rate_des = self.batched_params.kp_yaw[self.idxs].squeeze(-1) * yaw_err
             yaw_dot_err = yaw_rate_des - yaw_rate
-            M_yaw = -self.batched_params.kd_yaw[self.idxs].squeeze(-1) * yaw_dot_err
+            # PATCH testes-biguagym (P1): sinal positivo. O '-' compensava o modelo de guinada
+            # antigo (invertido); com o modelo corrigido ele virava realimentação positiva.
+            M_yaw = self.batched_params.kd_yaw[self.idxs].squeeze(-1) * yaw_dot_err
 
             # --- Combine moments (no pitch for 5-DoF) ---
             M_des = torch.zeros_like(F_des)
@@ -400,7 +413,9 @@ class Catamaran(VehicleModel):
             yaw_rate = w[:, 2]
             yaw_rate_des = self.batched_params.kp_yaw[self.idxs].squeeze(-1) * yaw_err
             yaw_dot_err = yaw_rate_des - yaw_rate
-            M_yaw = -self.batched_params.kd_yaw[self.idxs].squeeze(-1) * yaw_dot_err
+            # PATCH testes-biguagym (P1): sinal positivo. O '-' compensava o modelo de guinada
+            # antigo (invertido); com o modelo corrigido ele virava realimentação positiva.
+            M_yaw = self.batched_params.kd_yaw[self.idxs].squeeze(-1) * yaw_dot_err
 
             # --- Combine moments (no pitch for 5-DoF) ---
             M_des = torch.zeros_like(F_des)
@@ -453,7 +468,9 @@ class Catamaran(VehicleModel):
             yaw_rate = w[:, 2]
             yaw_rate_des = self.batched_params.kp_yaw[self.idxs].squeeze(-1) * yaw_err
             yaw_dot_err = yaw_rate_des - yaw_rate
-            M_yaw = -self.batched_params.kd_yaw[self.idxs].squeeze(-1) * yaw_dot_err
+            # PATCH testes-biguagym (P1): sinal positivo. O '-' compensava o modelo de guinada
+            # antigo (invertido); com o modelo corrigido ele virava realimentação positiva.
+            M_yaw = self.batched_params.kd_yaw[self.idxs].squeeze(-1) * yaw_dot_err
             # --- Apply yaw-aligned rotation to F_des ---
 
             # R_wb = roma.unitquat_to_rotmat(q).transpose(1,2)   # world->body
