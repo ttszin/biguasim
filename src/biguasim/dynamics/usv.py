@@ -129,6 +129,11 @@ class Catamaran(VehicleModel):
         # que fica bem acima na altura de repouso normal do barco -- ver
         # investigacao 2026-08-24).
         self.batched_params.rotor_z_offset = float(z)
+        # PATCH testes-biguagym -- braço lateral (y) de cada rotor, usado em
+        # _compute_body_wrench pra gerar a guinada pelo empuxo diferencial.
+        self.batched_params.rotor_y = torch.tensor(
+            [[p[k][1] for k in p] for p in self.batched_params.rotor_pos],
+            dtype=torch.float64, device=self.device)  # (B, num_rotors)
 
         alloc_mats = []
         for i in range(self.batch_size):
@@ -277,8 +282,12 @@ class Catamaran(VehicleModel):
 
         # Pitch negligible for symmetric frame, unless intentionally unbalanced
         mt_y = torch.zeros_like(ft_x)
-        # Yaw from counter-torque of horizontal thrusters
-        mt_z = (M[:, 0] - M[:, 1])
+        # PATCH testes-biguagym -- guinada = empuxo diferencial com braço
+        # (tau_z = sum(x_i*F_y,i - y_i*F_x,i) = -sum(y_i*T_i), empuxo só em x)
+        # + contra-torque das hélices. Antes era só o contra-torque (k_m),
+        # ~90x menor e com sinal trocado: o barco praticamente não girava.
+        rotor_y = self.batched_params.rotor_y[self.idxs].to(TT.dtype)
+        mt_z = -(rotor_y * TT).sum(dim=1) + (M[:, 0] - M[:, 1])
 
         MtotB = torch.stack([mt_x, mt_y, mt_z], dim=1)  # (B,3)
 
