@@ -179,7 +179,7 @@ class BiguaSimAgent:
         Returns:
             :class:`~biguasim.spaces.ActionSpace`: The action space for this agent and control
                 scheme."""
-        return self.control_abstractions[self._current_control_abstraction][1]
+        return self.control_abstractions[self._current_control_scheme][1]
 
     @property
     def control_abstractions(self):
