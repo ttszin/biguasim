@@ -80,9 +80,9 @@ class BlueBoat(usv.Catamaran):
         'k_vx': 1,            # The *world* velocity P gain (for cmd_vel, cmd_vel_yaw and cmd_pos_yaw)
 
         'kp_yaw': 1.2,            # The attitude P gain (for cmd_vel_yaw and cmd_pos_yaw)
-        'kd_yaw': 1.2,            # The attitude D gain (for cmd_vel_yaw and cmd_pos_yaw)
+        'kd_yaw': 10.0,           # PATCH testes-biguagym (P3): era 1.2, calibrado sem amortecimento de guinada (P2)
 
-        'kp_pos': .1,            # The attitude P gain (for cmd_pos_yaw)
+        'kp_pos': .3,            # PATCH testes-biguagym (P3): era .1 (v_des = kp_pos*dist ficava ~0.15 m/s)
         'kd_pos': .1,            # The attitude D gain (for cmd_pos_yaw)
 
         # PATCH testes-biguagym (P2): amortecimento de guinada. Calibrado para ~30°/s em regime
